@@ -153,19 +153,42 @@ html, body { overflow-x:hidden; overflow-x:clip; }
 @keyframes spGlow { 0%, 100% { filter:drop-shadow(0 0 0 rgba(212,173,85,0)); }
   50% { filter:drop-shadow(0 0 10px rgba(212,173,85,.55)); } }
 @keyframes sweep { 0% { background-position:150% 0; } 60%, 100% { background-position:-100% 0; } }
+
+/* Logo: spinning gold ring with a pulsing glow */
+.ring { position:relative; width:184px; height:184px; border-radius:50%; padding:8px; transform:rotate(-6deg);
+  animation:ringGlow 2.4s ease-in-out infinite; }
+.ring::before { content:""; position:absolute; inset:0; border-radius:50%;
+  background:conic-gradient(from 0deg, #9c7526, #d4ad55, #fff3c4, #d4ad55, #9c7526, #d4ad55, #fff3c4, #d4ad55, #9c7526);
+  animation:ringSpin 3s linear infinite; }
+.ring .logo { position:relative; display:block; width:168px; height:168px; border:0; box-shadow:none; transform:none; }
+.ring .logo:hover { transform:rotate(360deg); }
+@keyframes ringSpin { to { transform:rotate(360deg); } }
+@keyframes ringGlow {
+  0%, 100% { box-shadow:0 0 0 6px #151530, 0 0 0 0 rgba(212,173,85,0), 0 18px 50px rgba(0,0,0,.6); }
+  50% { box-shadow:0 0 0 6px #151530, 0 0 36px 8px rgba(212,173,85,.55), 0 18px 50px rgba(0,0,0,.6); } }
+/* Download button: light sweep, pulsing halo and a bouncing arrow */
+form button[type=submit] { position:relative; overflow:hidden; animation:btnPulse 2.2s ease-out infinite; }
+form button[type=submit]::after { content:""; position:absolute; inset:0; pointer-events:none;
+  background:linear-gradient(105deg, transparent 35%, rgba(255,255,255,.6) 50%, transparent 65%);
+  background-size:250% 100%; animation:btnSheen 2.6s ease-in-out infinite; }
+form button[type=submit]:disabled { animation:none; }
+.arr { display:inline-block; margin-right:10px; animation:arrBounce 1.1s ease-in-out infinite; }
+@keyframes btnPulse { 0% { box-shadow:0 0 0 0 rgba(212,173,85,.6); } 70%, 100% { box-shadow:0 0 0 16px rgba(212,173,85,0); } }
+@keyframes btnSheen { 0% { background-position:150% 0; } 60%, 100% { background-position:-100% 0; } }
+@keyframes arrBounce { 0%, 100% { transform:translateY(-3px); } 50% { transform:translateY(5px); } }
 </style>
 </head>
 <body>
   <div class="tape"><span>RIDE · SEND IT · STREET · PARK · DIRT · FLATLAND · RIDE · SEND IT · STREET · PARK · DIRT · FLATLAND · RIDE · SEND IT · STREET · PARK · DIRT · FLATLAND · </span></div>
   <main>
-    <img class="logo" src="/logo.jpg" alt="Logo">
+    <div class="ring"><img class="logo" src="/logo.jpg" alt="Logo"></div>
     <h1><span class="the">The</span><span class="w g">Legacy</span><span class="w i">Clip</span><span class="w l">Saver</span></h1>
     <p class="sub">Paste a Reel link and keep your tricks as MP4.</p>
     <div class="chips"><span class="chip">Street</span><span class="chip">Park</span><span class="chip">Dirt</span><span class="chip">Flatland</span><span class="chip">Race</span></div>
     <form class="card" id="f">
       <label for="url">Instagram link</label>
       <input id="url" type="url" placeholder="https://www.instagram.com/reel/..." required>
-      <button id="btn" type="submit">Download clip</button>
+      <button id="btn" type="submit"><span class="arr">↓</span>Download clip</button>
       <div id="status" role="status"></div>
     </form>
     <small>Use it for your own videos or content you have permission to save.</small>
