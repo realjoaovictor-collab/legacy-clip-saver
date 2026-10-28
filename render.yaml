@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: legacy-clip-saver
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: COOKIES
+        sync: false
