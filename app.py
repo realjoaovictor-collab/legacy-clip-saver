@@ -39,7 +39,9 @@ PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The Legacy Clip Saver</title>
-<link rel="icon" href="/logo.jpg">
+<link rel="icon" href="/apple-touch-icon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-title" content="Legacy">
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Barlow:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
   :root { --bg:#0b0b14; --panel:#151530; --ink:#f4f1ea; --muted:#a6a3bd; --line:#2c2c52;
@@ -190,6 +192,8 @@ form button[type=submit]:disabled { animation:none; }
       <input id="url" type="url" placeholder="https://www.instagram.com/reel/..." required>
       <button id="btn" type="submit"><span class="arr">↓</span>Download clip</button>
       <div id="status" role="status"></div>
+      <button id="save" type="button" hidden>Save to Photos</button>
+      <p id="hint" hidden>In the menu that opens, tap <b>Save Video</b>.</p>
     </form>
     <small>Use it for your own videos or content you have permission to save.</small>
   </main>
@@ -201,26 +205,58 @@ form button[type=submit]:disabled { animation:none; }
 <script>
 const f = document.getElementById('f'), btn = document.getElementById('btn'),
       st = document.getElementById('status'), inp = document.getElementById('url');
+const save = document.getElementById('save'), hint = document.getElementById('hint');
+let lastFile = null;
+
+function downloadFile(file) {
+  // Fallback for browsers without file sharing: a normal download (iPhone puts it in Files > Downloads)
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(file); a.download = file.name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
 f.addEventListener('submit', async (e) => {
   e.preventDefault();
+  const url = inp.value.trim();
+  if (!url) return;
+  inp.value = '';                       // the link leaves the box as soon as it is used
+  save.hidden = true; hint.hidden = true; lastFile = null;
   btn.disabled = true; st.className = ''; st.innerHTML = '<span class="wheel"></span>Dropping in… this can take a few seconds.';
   try {
     const r = await fetch('/download', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: inp.value.trim() }) });
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || 'Download failed.'); }
     const blob = await r.blob();
     let name = 'instagram.mp4';
     const cd = r.headers.get('Content-Disposition') || '';
     const m = cd.match(/filename\\*?=(?:UTF-8'')?"?([^";]+)"?/i);
     if (m) name = decodeURIComponent(m[1]);
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = name;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-    st.className = 'ok'; st.textContent = 'Clip saved: ' + name + ' 🤘';
+    const file = new File([blob], name, { type: 'video/mp4' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      // Phones: the share sheet has "Save Video", which puts the clip in the Photos library
+      lastFile = file; save.hidden = false; hint.hidden = false;
+      st.className = 'ok'; st.textContent = 'Clip ready! 🤘';
+    } else {
+      downloadFile(file);
+      st.className = 'ok'; st.textContent = 'Clip downloaded: ' + name + ' 🤘';
+    }
   } catch (err) {
     st.className = 'err'; st.textContent = err.message;
   } finally { btn.disabled = false; }
+});
+
+save.addEventListener('click', async () => {
+  if (!lastFile) return;
+  try {
+    await navigator.share({ files: [lastFile] });
+    st.className = 'ok'; st.textContent = 'Saved! Check your Photos 🤘';
+    save.hidden = true; hint.hidden = true;
+  } catch (err) {
+    if (err.name === 'AbortError') return;   // user closed the menu; keep the button
+    downloadFile(lastFile);
+    st.className = 'ok'; st.textContent = 'Downloaded to Files instead. Open it there and share to Photos.';
+  }
 });
 </script>
 </body>
@@ -240,6 +276,12 @@ def render_page():
 @app.get("/")
 def index():
     return render_page()
+
+
+@app.get("/apple-touch-icon.png")
+@app.get("/apple-touch-icon-precomposed.png")
+def touch_icon():
+    return send_file(os.path.join(HERE, "apple-touch-icon.png"))
 
 
 @app.get("/logo.jpg")
