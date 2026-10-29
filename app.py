@@ -13,6 +13,8 @@ Private posts / when Instagram asks you to log in:
 """
 import json
 import os
+import threading
+import traceback
 import re
 import shutil
 import subprocess
@@ -238,8 +240,19 @@ f.addEventListener('submit', async (e) => {
   try {
     const r = await fetch('/download', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
-    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || 'Download failed.'); }
-    const info = await r.json();
+    const start = await r.json().catch(() => null);
+    if (!r.ok || !start || !start.id) throw new Error((start && start.error) || ('Server error (' + r.status + '). Try again in a moment.'));
+    let info = null;
+    for (let i = 0; i < 160; i++) {            // wait up to ~4 minutes
+      await new Promise(res => setTimeout(res, 1500));
+      const sr = await fetch('/status/' + start.id, { cache: 'no-store' }).catch(() => null);
+      const s = sr ? await sr.json().catch(() => null) : null;
+      if (!s) continue;                          // server busy waking up: keep waiting
+      if (s.state === 'done') { info = { id: start.id, name: s.name }; break; }
+      if (s.state === 'error') throw new Error(s.error || 'Download failed.');
+      if (i === 10) st.innerHTML = '<span class="wheel"></span>Still working… long clips take a bit more.';
+    }
+    if (!info) throw new Error('This is taking too long. Try again in a moment.');
     const name = info.name || 'clip.mp4';
     st.innerHTML = '<span class="wheel"></span>Almost there…';
     const fr = await fetch('/file/' + info.id);
@@ -345,7 +358,7 @@ def make_iphone_ready(src, dst):
     copy_video = bool(video) and video.get("codec_name") == "h264" and video.get("pix_fmt") in ("yuv420p", "yuvj420p")
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-map", "0:v:0"]
     cmd += ["-c:v", "copy"] if copy_video else [
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2", "-pix_fmt", "yuv420p",
         "-profile:v", "high", "-level", "4.1"]
     if audio:
         cmd += ["-map", "0:a:0"]
@@ -356,62 +369,123 @@ def make_iphone_ready(src, dst):
         raise RuntimeError("Could not convert the video: " + result.stderr[-300:])
 
 
+JOB_ID_RE = CLIP_ID_RE
+
+
+class FriendlyError(Exception):
+    """An error whose message is safe and useful to show on the page."""
+
+
+def write_status(job, **data):
+    tmp_path = os.path.join(STORE, job + ".json.tmp")
+    with open(tmp_path, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp_path, os.path.join(STORE, job + ".json"))
+
+
+def read_status(job):
+    try:
+        with open(os.path.join(STORE, job + ".json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def explain(msg):
+    low = msg.lower()
+    if any(k in low for k in ("login", "log in", "rate-limit", "rate limit", "checkpoint",
+                              "not available", "empty media", "private", "401", "403", "429")):
+        return ("Instagram blocked the download from the server and asked for a login. "
+                "Add your Instagram cookies to the COOKIES setting on Render (see README), then try again.")
+    if "unsupported url" in low or "no video" in low:
+        return "No video found at that link. Check that it is a Reel or a video post."
+    return msg.replace("ERROR: ", "")[:300]
+
+
+def fetch_video(url, folder):
+    base_opts = {
+        "outtmpl": os.path.join(folder, "%(uploader)s_%(id)s.%(ext)s"),
+        "merge_output_format": "mp4",
+        "noplaylist": False,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+        "socket_timeout": 30,
+    }
+    browser = os.environ.get("BROWSER")
+    if browser:
+        base_opts["cookiesfrombrowser"] = (browser,)
+    # On a server there is no browser: paste the contents of an Instagram
+    # cookies.txt file into the COOKIES environment variable instead.
+    cookies = os.environ.get("COOKIES")
+    if cookies:
+        cookie_path = os.path.join(folder, "cookies.txt")
+        with open(cookie_path, "w") as fh:
+            fh.write(cookies.replace("\\n", "\n"))
+        base_opts["cookiefile"] = cookie_path
+
+    # Try H.264 first (no conversion needed for iPhone), then anything that works
+    formats = (["bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]", "bv*+ba/b", "best"] if HAS_FFMPEG
+               else ["best[ext=mp4]/best"])
+    last = None
+    for fmt in formats:
+        try:
+            with yt_dlp.YoutubeDL({**base_opts, "format": fmt}) as ydl:
+                ydl.extract_info(url, download=True)
+            last = None
+            break
+        except yt_dlp.utils.DownloadError as e:
+            last = str(e)
+            if "format" not in last.lower():
+                break  # not a format problem: trying other formats will not help
+    if last:
+        raise FriendlyError(explain(last))
+    videos = sorted(f for f in os.listdir(folder) if f.lower().endswith((".mp4", ".mov", ".webm", ".mkv", ".m4v")))
+    if not videos:
+        raise FriendlyError("No video found at that link (it may be a photo only).")
+    return os.path.join(folder, videos[0])
+
+
+def run_job(job, url):
+    folder = tempfile.mkdtemp(prefix="insta_")
+    try:
+        src = fetch_video(url, folder)
+        base = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(src))[0]).strip("_") or "clip"
+        name = f"{base[:60]}.mp4"
+        try:
+            make_iphone_ready(src, os.path.join(STORE, job + ".mp4"))
+        except RuntimeError as e:
+            raise FriendlyError(str(e))
+        write_status(job, state="done", name=name)
+    except FriendlyError as e:
+        write_status(job, state="error", error=str(e))
+    except Exception as e:  # never leave the page waiting forever
+        traceback.print_exc()
+        write_status(job, state="error", error="Server error: " + explain(f"{type(e).__name__}: {e}"))
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 @app.post("/download")
 def download():
     purge_old_clips()
     url = (request.get_json(silent=True) or {}).get("url", "").strip()
     if not INSTAGRAM_RE.match(url):
         return jsonify(error="That's not an Instagram link. Use a Reel, post or story link."), 400
+    job = uuid.uuid4().hex
+    write_status(job, state="working")
+    threading.Thread(target=run_job, args=(job, url), daemon=True).start()
+    return jsonify(id=job)
 
-    tmp = tempfile.mkdtemp(prefix="insta_")
-    opts = {
-        "outtmpl": os.path.join(tmp, "%(uploader)s_%(id)s.%(ext)s"),
-        # Prefer H.264 (what iPhones save natively) with the best audio, merged into MP4
-        "format": ("bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b" if HAS_FFMPEG else "best[ext=mp4]/best"),
-        "merge_output_format": "mp4",
-        "noplaylist": False,
-        "quiet": True,
-        "no_warnings": True,
-    }
-    browser = os.environ.get("BROWSER")
-    if browser:
-        opts["cookiesfrombrowser"] = (browser,)
-    # On a server there is no browser: paste the contents of an Instagram
-    # cookies.txt file into the COOKIES environment variable instead.
-    cookies = os.environ.get("COOKIES")
-    if cookies:
-        cookie_path = os.path.join(tmp, "cookies.txt")
-        with open(cookie_path, "w") as fh:
-            fh.write(cookies.replace("\\n", "\n"))
-        opts["cookiefile"] = cookie_path
 
-    try:
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
-        except yt_dlp.utils.DownloadError as e:
-            msg = str(e)
-            if "login" in msg.lower() or "private" in msg.lower() or "rate" in msg.lower():
-                msg = ("Instagram asked for a login. Add your Instagram cookies to the COOKIES "
-                       "setting on the server (see README) and try again.")
-            return jsonify(error=msg.replace("ERROR: ", "")), 502
-
-        videos = sorted(f for f in os.listdir(tmp) if f.lower().endswith((".mp4", ".mov", ".webm", ".mkv")))
-        if not videos:
-            return jsonify(error="No video found at that link (it may be a photo only)."), 404
-
-        clip_id = uuid.uuid4().hex
-        base = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(videos[0])[0]).strip("_") or "clip"
-        name = f"{base[:60]}.mp4"
-        try:
-            make_iphone_ready(os.path.join(tmp, videos[0]), os.path.join(STORE, clip_id + ".mp4"))
-        except RuntimeError as e:
-            return jsonify(error=str(e)), 500
-        with open(os.path.join(STORE, clip_id + ".txt"), "w") as fh:
-            fh.write(name)
-        return jsonify(id=clip_id, name=name, size=os.path.getsize(os.path.join(STORE, clip_id + ".mp4")))
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+@app.get("/status/<job>")
+def job_status(job):
+    if not JOB_ID_RE.match(job):
+        abort(404)
+    status = read_status(job)
+    if status is None:
+        return jsonify(state="error", error="This download expired. Paste the link again."), 404
+    return jsonify(status)
 
 
 @app.get("/file/<clip_id>")
@@ -421,13 +495,14 @@ def get_clip(clip_id):
     path = os.path.join(STORE, clip_id + ".mp4")
     if not os.path.exists(path):
         abort(404)
-    try:
-        with open(os.path.join(STORE, clip_id + ".txt")) as fh:
-            name = fh.read().strip() or "clip.mp4"
-    except OSError:
-        name = "clip.mp4"
+    name = (read_status(clip_id) or {}).get("name") or "clip.mp4"
     as_file = request.args.get("dl") == "1"
     return send_file(path, mimetype="video/mp4", as_attachment=as_file, download_name=name, conditional=True)
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify(error="Server error. Try again in a moment."), 500
 
 
 if __name__ == "__main__":

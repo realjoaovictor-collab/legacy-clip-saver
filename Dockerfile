@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir -U -r requirements.txt
 COPY . .
 
 ENV PORT=10000
-CMD gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 180 app:app
+CMD gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 300 app:app
