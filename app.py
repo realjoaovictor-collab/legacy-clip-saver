@@ -11,10 +11,14 @@ Private posts / when Instagram asks you to log in:
     logged in to Instagram (chrome, firefox, edge, safari, brave...).
     Example: BROWSER=chrome python app.py
 """
+import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
+import time
+import uuid
 
 from flask import Flask, abort, after_this_request, jsonify, request, send_file
 import yt_dlp
@@ -178,6 +182,13 @@ form button[type=submit]:disabled { animation:none; }
 @keyframes btnPulse { 0% { box-shadow:0 0 0 0 rgba(212,173,85,.6); } 70%, 100% { box-shadow:0 0 0 16px rgba(212,173,85,0); } }
 @keyframes btnSheen { 0% { background-position:150% 0; } 60%, 100% { background-position:-100% 0; } }
 @keyframes arrBounce { 0%, 100% { transform:translateY(-3px); } 50% { transform:translateY(5px); } }
+
+[hidden] { display:none !important; }
+#save { background:var(--lilac); color:var(--bg); animation:btnPulse 2.2s ease-out infinite; }
+#save:hover { background:var(--gold); }
+#hint { margin:0; color:var(--muted); font-size:.92rem; text-align:center; }
+
+.alt { display:block; text-align:center; color:var(--lilac); font-weight:600; text-decoration:underline; padding:6px; }
 </style>
 </head>
 <body>
@@ -194,6 +205,7 @@ form button[type=submit]:disabled { animation:none; }
       <div id="status" role="status"></div>
       <button id="save" type="button" hidden>Save to Photos</button>
       <p id="hint" hidden>In the menu that opens, tap <b>Save Video</b>.</p>
+      <a id="dlfile" class="alt" href="#" hidden>Download file instead</a>
     </form>
     <small>Use it for your own videos or content you have permission to save.</small>
   </main>
@@ -205,7 +217,7 @@ form button[type=submit]:disabled { animation:none; }
 <script>
 const f = document.getElementById('f'), btn = document.getElementById('btn'),
       st = document.getElementById('status'), inp = document.getElementById('url');
-const save = document.getElementById('save'), hint = document.getElementById('hint');
+const save = document.getElementById('save'), hint = document.getElementById('hint'), dl = document.getElementById('dlfile');
 let lastFile = null;
 
 function downloadFile(file) {
@@ -221,18 +233,20 @@ f.addEventListener('submit', async (e) => {
   const url = inp.value.trim();
   if (!url) return;
   inp.value = '';                       // the link leaves the box as soon as it is used
-  save.hidden = true; hint.hidden = true; lastFile = null;
+  save.hidden = true; hint.hidden = true; dl.hidden = true; lastFile = null;
   btn.disabled = true; st.className = ''; st.innerHTML = '<span class="wheel"></span>Dropping in… this can take a few seconds.';
   try {
     const r = await fetch('/download', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || 'Download failed.'); }
-    const blob = await r.blob();
-    let name = 'instagram.mp4';
-    const cd = r.headers.get('Content-Disposition') || '';
-    const m = cd.match(/filename\\*?=(?:UTF-8'')?"?([^";]+)"?/i);
-    if (m) name = decodeURIComponent(m[1]);
+    const info = await r.json();
+    const name = info.name || 'clip.mp4';
+    st.innerHTML = '<span class="wheel"></span>Almost there…';
+    const fr = await fetch('/file/' + info.id);
+    if (!fr.ok) throw new Error('The clip expired. Paste the link again.');
+    const blob = await fr.blob();
     const file = new File([blob], name, { type: 'video/mp4' });
+    dl.href = '/file/' + info.id + '?dl=1'; dl.hidden = false;
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
       // Phones: the share sheet has "Save Video", which puts the clip in the Photos library
       lastFile = file; save.hidden = false; hint.hidden = false;
@@ -299,8 +313,52 @@ def sponsor(name):
     return send_file(path)
 
 
+# Finished clips wait here (shared by all server workers) until the phone fetches them
+STORE = os.path.join(tempfile.gettempdir(), "legacy_clips")
+os.makedirs(STORE, exist_ok=True)
+CLIP_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+def purge_old_clips(max_age=20 * 60):
+    now = time.time()
+    for name in os.listdir(STORE):
+        path = os.path.join(STORE, name)
+        try:
+            if now - os.path.getmtime(path) > max_age:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def make_iphone_ready(src, dst):
+    """Write an MP4 the iPhone Photos app accepts: H.264 video (yuv420p), AAC audio, faststart."""
+    if not HAS_FFMPEG:
+        shutil.move(src, dst)
+        return
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt", "-of", "json", src],
+        capture_output=True, text=True)
+    streams = json.loads(probe.stdout or "{}").get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    copy_video = bool(video) and video.get("codec_name") == "h264" and video.get("pix_fmt") in ("yuv420p", "yuvj420p")
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-map", "0:v:0"]
+    cmd += ["-c:v", "copy"] if copy_video else [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+        "-profile:v", "high", "-level", "4.1"]
+    if audio:
+        cmd += ["-map", "0:a:0"]
+        cmd += ["-c:a", "copy"] if audio.get("codec_name") == "aac" else ["-c:a", "aac", "-b:a", "160k"]
+    cmd += ["-tag:v", "avc1", "-movflags", "+faststart", dst]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("Could not convert the video: " + result.stderr[-300:])
+
+
 @app.post("/download")
 def download():
+    purge_old_clips()
     url = (request.get_json(silent=True) or {}).get("url", "").strip()
     if not INSTAGRAM_RE.match(url):
         return jsonify(error="That's not an Instagram link. Use a Reel, post or story link."), 400
@@ -308,7 +366,9 @@ def download():
     tmp = tempfile.mkdtemp(prefix="insta_")
     opts = {
         "outtmpl": os.path.join(tmp, "%(uploader)s_%(id)s.%(ext)s"),
-        "format": "best[ext=mp4]/best",
+        # Prefer H.264 (what iPhones save natively) with the best audio, merged into MP4
+        "format": ("bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b" if HAS_FFMPEG else "best[ext=mp4]/best"),
+        "merge_output_format": "mp4",
         "noplaylist": False,
         "quiet": True,
         "no_warnings": True,
@@ -326,29 +386,48 @@ def download():
         opts["cookiefile"] = cookie_path
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
-    except yt_dlp.utils.DownloadError as e:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError as e:
+            msg = str(e)
+            if "login" in msg.lower() or "private" in msg.lower() or "rate" in msg.lower():
+                msg = ("Instagram asked for a login. Add your Instagram cookies to the COOKIES "
+                       "setting on the server (see README) and try again.")
+            return jsonify(error=msg.replace("ERROR: ", "")), 502
+
+        videos = sorted(f for f in os.listdir(tmp) if f.lower().endswith((".mp4", ".mov", ".webm", ".mkv")))
+        if not videos:
+            return jsonify(error="No video found at that link (it may be a photo only)."), 404
+
+        clip_id = uuid.uuid4().hex
+        base = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(videos[0])[0]).strip("_") or "clip"
+        name = f"{base[:60]}.mp4"
+        try:
+            make_iphone_ready(os.path.join(tmp, videos[0]), os.path.join(STORE, clip_id + ".mp4"))
+        except RuntimeError as e:
+            return jsonify(error=str(e)), 500
+        with open(os.path.join(STORE, clip_id + ".txt"), "w") as fh:
+            fh.write(name)
+        return jsonify(id=clip_id, name=name, size=os.path.getsize(os.path.join(STORE, clip_id + ".mp4")))
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        msg = str(e)
-        if "login" in msg.lower() or "private" in msg.lower() or "rate" in msg.lower():
-            msg = ("Instagram asked for a login. Log in to Instagram in your browser "
-                   "and restart the app with BROWSER=chrome (or firefox, edge...).")
-        return jsonify(error=msg.replace("ERROR: ", "")), 502
 
-    videos = [f for f in os.listdir(tmp) if f.lower().endswith((".mp4", ".mov", ".webm", ".mkv"))]
-    if not videos:
-        shutil.rmtree(tmp, ignore_errors=True)
-        return jsonify(error="No video found at that link (it may be a photo only)."), 404
 
-    path = os.path.join(tmp, sorted(videos)[0])
-
-    @after_this_request
-    def cleanup(resp):
-        resp.call_on_close(lambda: shutil.rmtree(tmp, ignore_errors=True))
-        return resp
-
-    return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+@app.get("/file/<clip_id>")
+def get_clip(clip_id):
+    if not CLIP_ID_RE.match(clip_id):
+        abort(404)
+    path = os.path.join(STORE, clip_id + ".mp4")
+    if not os.path.exists(path):
+        abort(404)
+    try:
+        with open(os.path.join(STORE, clip_id + ".txt")) as fh:
+            name = fh.read().strip() or "clip.mp4"
+    except OSError:
+        name = "clip.mp4"
+    as_file = request.args.get("dl") == "1"
+    return send_file(path, mimetype="video/mp4", as_attachment=as_file, download_name=name, conditional=True)
 
 
 if __name__ == "__main__":
